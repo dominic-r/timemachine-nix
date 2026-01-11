@@ -1,6 +1,72 @@
 { config, pkgs, lib, modulesPath, ... }:
 
-{
+let
+  # authentik forward auth configuration
+  # NOTE: Apps are pointed to authentik-proxy-cloud-01, not the embedded outpost
+  # as one might assume due to the Traefik router rule at:
+  # https://git.sdko.net/s.git/tree/infra/cluster/cloud-01/authentik-proxy-cloud-01/docker-compose.yml#n24
+  authentikOutpost = "https://sso.sdko.net/outpost.goauthentik.io";
+
+  forwardAuthConfig = ''
+    auth_request        /outpost.goauthentik.io/auth/nginx;
+    error_page          401 = @goauthentik_proxy_signin;
+    auth_request_set    $auth_cookie $upstream_http_set_cookie;
+    add_header          Set-Cookie $auth_cookie;
+
+    # Translate headers from the outpost back to the upstream
+    auth_request_set $authentik_username $upstream_http_x_authentik_username;
+    auth_request_set $authentik_groups $upstream_http_x_authentik_groups;
+    auth_request_set $authentik_entitlements $upstream_http_x_authentik_entitlements;
+    auth_request_set $authentik_email $upstream_http_x_authentik_email;
+    auth_request_set $authentik_name $upstream_http_x_authentik_name;
+    auth_request_set $authentik_uid $upstream_http_x_authentik_uid;
+
+    proxy_set_header X-authentik-username $authentik_username;
+    proxy_set_header X-authentik-groups $authentik_groups;
+    proxy_set_header X-authentik-entitlements $authentik_entitlements;
+    proxy_set_header X-authentik-email $authentik_email;
+    proxy_set_header X-authentik-name $authentik_name;
+    proxy_set_header X-authentik-uid $authentik_uid;
+  '';
+
+  # Shared authentik locations for each vhost
+  authentikLocations = {
+    # All requests to /outpost.goauthentik.io must be accessible without authentication
+    "/outpost.goauthentik.io" = {
+      proxyPass = authentikOutpost;
+      extraConfig = ''
+        proxy_ssl_verify              off;
+        proxy_set_header              Host sso.sdko.net;
+        proxy_set_header              X-Forwarded-Host $host;
+        proxy_set_header              X-Original-URL $scheme://$http_host$request_uri;
+        add_header                    Set-Cookie $auth_cookie;
+        auth_request_set              $auth_cookie $upstream_http_set_cookie;
+        proxy_pass_request_body       off;
+        proxy_set_header              Content-Length "";
+      '';
+    };
+
+    # When the /auth endpoint returns 401, redirect to /start to initiate SSO
+    "@goauthentik_proxy_signin" = {
+      extraConfig = ''
+        internal;
+        add_header Set-Cookie $auth_cookie;
+        return 302 /outpost.goauthentik.io/start?rd=$scheme://$http_host$request_uri;
+      '';
+    };
+  };
+
+  # Common SSL config
+  sslConfig = {
+    forceSSL = true;
+    sslCertificate = "/etc/ssl/nodeexporter-timemachine-svc.sdko.net/fullchain.cer";
+    sslCertificateKey = "/etc/ssl/nodeexporter-timemachine-svc.sdko.net/key.pem";
+    extraConfig = ''
+      proxy_buffers 8 16k;
+      proxy_buffer_size 32k;
+    '';
+  };
+in {
   imports = [
     (modulesPath + "/profiles/qemu-guest.nix")
   ];
@@ -51,10 +117,51 @@
     };
   };
 
+  # Prometheus node exporter
+  services.prometheus.exporters.node = {
+    enable = true;
+    port = 9100;
+    listenAddress = "127.0.0.1";
+    enabledCollectors = [
+      "systemd"
+      "processes"
+    ];
+  };
+
+  # nginx
+  services.nginx = {
+    enable = true;
+    recommendedOptimisation = true;
+    recommendedGzipSettings = true;
+    recommendedProxySettings = false;
+    serverTokens = false;
+    package = pkgs.nginxMainline.override {
+      modules = [ pkgs.nginxModules.moreheaders ];
+    };
+
+    commonHttpConfig = ''
+      more_set_headers "Server: SDKO Timemachine Server";
+      more_set_headers "Via: 1.1 sws-gateway";
+    '';
+
+    virtualHosts."nodeexporter-timemachine-svc.sdko.net" = sslConfig // {
+      locations = authentikLocations // {
+        "/" = {
+          proxyPass = "http://127.0.0.1:9100";
+          extraConfig = forwardAuthConfig + ''
+            proxy_set_header X-Real-IP $remote_addr;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+            proxy_set_header X-Forwarded-Proto $scheme;
+          '';
+        };
+      };
+    };
+  };
+
   # Firewall
   networking.firewall = {
     enable = true;
-    allowedTCPPorts = [ 22 445 ];
+    allowedTCPPorts = [ 22 80 443 445 ];
     allowedUDPPorts = [ 137 138 ];
   };
 
@@ -139,9 +246,10 @@
     };
   };
 
-  # Backup directory
+  # Backup directory and SSL certs
   systemd.tmpfiles.rules = [
     "d /var/lib/timemachine 0750 timemachinedominic timemachine -"
+    "d /etc/ssl/nodeexporter-timemachine-svc.sdko.net 0750 root nginx -"
   ];
 
   system.stateVersion = "24.11";
